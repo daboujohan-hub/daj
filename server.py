@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """DAJ : messagerie entre le développeur et ses vendeuses (site installable)."""
-import json, os, re, time, hmac, hashlib, base64, secrets, mimetypes, traceback
+import json, os, re, time, hmac, hashlib, base64, secrets, mimetypes, traceback, threading, calendar
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -53,6 +53,8 @@ def lire_jeton(tok):
         u = STORE.user(d["u"])
         if not u or u["h"][:8] != d["g"]:
             return None
+        if u.get("exp") and time.time() > u["exp"]:
+            return None
         return ("v", d["u"])
     except Exception:
         return None
@@ -79,6 +81,173 @@ def sauver_image(data_url, uid):
     nom = secrets.token_hex(12) + ext
     STORE.image_enregistrer(nom, uid, {"jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}[m.group(1)], raw)
     return nom
+
+
+# LOT1_V1 : notifications, rappels, message d'absence
+DEFAUT_CFG = {"rappel_h": 3, "absence_on": False,
+              "absence_txt": "Bonjour ! Je suis indisponible pour le moment. Je réponds à tes messages dès que possible."}
+FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def reglages():
+    c = dict(DEFAUT_CFG)
+    c.update(STORE.cfg())
+    return c
+
+
+def push_dispo():
+    try:
+        import pywebpush  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def envoyer_push(sub, payload):
+    from pywebpush import webpush
+    priv, _ = STORE.vapid()
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
+    claim = os.environ.get("VAPID_SUB") or ("https://" + host if host else "mailto:contact@example.com")
+    webpush(subscription_info=sub, data=json.dumps(payload, ensure_ascii=False), vapid_private_key=priv,
+            vapid_claims={"sub": claim}, ttl=86400)
+
+
+def _diffuser(role, uid, payload):
+    n, erreurs = 0, []
+    for cid, sub in STORE.push_liste(role, uid):
+        try:
+            envoyer_push(sub, payload)
+            n += 1
+        except Exception as e:
+            code = getattr(getattr(e, "response", None), "status_code", 0)
+            if code in (404, 410):
+                STORE.push_supprimer(cid)
+            else:
+                erreurs.append("%s %s" % (type(e).__name__, code or ""))
+    return n, erreurs
+
+
+def pousser(role, uid, titre, corps, tag):
+    """Notification sur tous les appareils d'une personne (en arriere-plan)."""
+    if not push_dispo():
+        return
+    payload = {"title": titre, "body": corps, "tag": tag, "url": "/"}
+
+    def run():
+        try:
+            _diffuser(role, uid, payload)
+        except Exception:
+            traceback.print_exc()
+    if os.environ.get("DAJ_PUSH_SYNC") == "1":
+        run()
+    else:
+        threading.Thread(target=run, daemon=True).start()
+
+
+def apres_envoi(uid, de, texte):
+    u = STORE.user(uid) or {}
+    apercu = texte[:90] if texte else "📷 Photo"
+    if de == "v":
+        if not u.get("muet"):
+            pousser("d", "", u.get("nom", "Vendeuse"), apercu, "v" + uid)
+        c = reglages()
+        if c.get("absence_on") and c.get("absence_txt") and time.time() - float(u.get("auto_ts") or 0) > 6 * 3600:
+            STORE.user_maj(uid, {"auto_ts": time.time()})
+            STORE.envoyer(uid, "d", c["absence_txt"], "", auto=True)
+            pousser("v", uid, "DAJ", c["absence_txt"][:90], "d" + uid)
+    else:
+        pousser("v", uid, "DAJ", apercu, "d" + uid)
+
+
+def faire_rappels(maintenant=None):
+    """Previent le developpeur quand une vendeuse attend une reponse depuis trop longtemps."""
+    t = maintenant or time.time()
+    h = int(reglages().get("rappel_h") or 0)
+    hr = time.gmtime(t).tm_hour
+    if not h or hr >= 22 or hr < 7:
+        return 0
+    n = 0
+    for u in STORE.users():
+        d = STORE.user(u["id"]) or {}
+        if d.get("muet") or not d.get("unread_dev") or d.get("last_from") != "v":
+            continue
+        if d.get("rappel_seq") == d.get("n"):
+            continue
+        if calendar.timegm(time.strptime(d["last_ts"], FMT)) > t - h * 3600:
+            continue
+        STORE.user_maj(d["id"], {"rappel_seq": d.get("n")})
+        pousser("d", "", "Rappel : " + d["nom"], "Attend ta réponse depuis plus de %d h." % h, "r" + d["id"])
+        n += 1
+    return n
+
+
+def boucle_rappels():
+    while True:
+        time.sleep(600)
+        try:
+            faire_rappels()
+        except Exception:
+            traceback.print_exc()
+
+
+STATUTS = ("prospect", "test", "active", "pause")
+
+
+def jours_ok(v):
+    try:
+        j = int(v or 0)
+    except (TypeError, ValueError):
+        raise ValueError("Durée invalide.")
+    if j not in (0, 7, 30, 90):
+        raise ValueError("Durée invalide.")
+    return j
+
+
+def propre(v, n):
+    return re.sub(r"\s+", " ", str(v or "")).strip()[:n]
+
+
+def champs_fiche(d):
+    """Vérifie ce que le développeur modifie sur la fiche d'une vendeuse."""
+    c = {}
+    if "nom" in d:
+        c["nom"] = propre(d["nom"], 60)
+        if len(c["nom"]) < 2:
+            raise ValueError("Le nom est trop court.")
+    if "wa" in d:
+        c["wa"] = re.sub(r"\D", "", str(d["wa"] or ""))[:20]
+    if "ville" in d:
+        c["ville"] = propre(d["ville"], 60)
+    if "boutique" in d:
+        b = str(d["boutique"] or "").strip()[:200]
+        if b and not re.match(r"^https?://[^\s]+$", b):
+            raise ValueError("Le lien de la boutique doit commencer par https://")
+        c["boutique"] = b
+    if "statut" in d:
+        if d["statut"] not in STATUTS:
+            raise ValueError("Statut inconnu.")
+        c["statut"] = d["statut"]
+    if "notes" in d:
+        c["notes"] = str(d["notes"] or "").strip()[:2000]
+    if "tags" in d:
+        t = d["tags"] if isinstance(d["tags"], list) else str(d["tags"] or "").split(",")
+        vus = []
+        for x in t:
+            x = propre(x, 24)
+            if x and x.lower() not in [y.lower() for y in vus]:
+                vus.append(x)
+        c["tags"] = vus[:8]
+    if "muet" in d:
+        c["muet"] = bool(d["muet"])
+    return c
+def texte_export(nom, msgs):
+    jours = ["lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."]
+    l = ["Conversation DAJ avec " + nom, "Export du " + time.strftime("%d/%m/%Y %H:%M UTC", time.gmtime()), ""]
+    for m in msgs:
+        qui = "Développeur" if m["de"] == "d" else nom
+        corps = (m.get("t") or "") + (" [photo]" if m.get("img") else "")
+        l.append("[%s] %s : %s" % (m["ts"], qui, corps.strip()))
+    return "\n".join(l) + "\n"
 
 
 class H(BaseHTTPRequestHandler):
@@ -165,6 +334,59 @@ class H(BaseHTTPRequestHandler):
             if not a or a[0] != "d":
                 return self.json({"erreur": "Connexion nécessaire."}, 401)
             return self.json({"users": STORE.users()})
+        if p == "/api/user":
+            a = self.auth()
+            if not a or a[0] != "d":
+                return self.json({"erreur": "Connexion nécessaire."}, 401)
+            f = STORE.fiche(str(q.get("uid") or "")[:8])
+            return self.json({"user": f}) if f else self.json({"erreur": "Introuvable."}, 404)
+        if p == "/api/push/key":
+            a = self.auth()
+            if not a:
+                return self.json({"erreur": "Connexion nécessaire."}, 401)
+            return self.json({"key": STORE.vapid()[1], "dispo": push_dispo()})
+        if p == "/api/settings":
+            a = self.auth()
+            if not a or a[0] != "d":
+                return self.json({"erreur": "Connexion nécessaire."}, 401)
+            return self.json({"reglages": reglages()})
+        if p == "/api/log":
+            a = self.auth()
+            if not a or a[0] != "d":
+                return self.json({"erreur": "Connexion nécessaire."}, 401)
+            noms = {u["id"]: u["nom"] for u in STORE.users()}
+            l = [dict(e, nom=noms.get(e.get("uid"), "")) for e in STORE.journal(100)]
+            return self.json({"log": l})
+        if p == "/api/search":
+            a = self.auth()
+            if not a:
+                return self.json({"erreur": "Connexion nécessaire."}, 401)
+            uid = self.cible(a, q)
+            mot = str(q.get("q") or "").strip()[:60]
+            if not uid or len(mot) < 2:
+                return self.json({"res": []})
+            if len(hits("r:" + uid + a[0], 60)) >= 20:
+                return self.json({"erreur": "Doucement, réessaie dans une minute."}, 429)
+            HITS.setdefault("r:" + uid + a[0], []).append(time.time())
+            return self.json({"res": STORE.rechercher(uid, mot) or []})
+        if p == "/api/export":
+            a = self.auth()
+            if not a:
+                return self.json({"erreur": "Connexion nécessaire."}, 401)
+            uid = self.cible(a, q)
+            if not uid:
+                return self.json({"erreur": "Conversation introuvable."}, 404)
+            nom = (STORE.user(uid) or {}).get("nom", "")
+            b = texte_export(nom, STORE.tout(uid) or []).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.send_header("Content-Disposition", 'attachment; filename="conversation-daj.txt"')
+            self.send_header("Cache-Control", "no-store")
+            self.entetes()
+            self.end_headers()
+            self.wfile.write(b)
+            return
         if p == "/api/msgs":
             a = self.auth()
             if not a:
@@ -251,13 +473,19 @@ class H(BaseHTTPRequestHandler):
             if "password" in d:
                 if DEV_PASSWORD and hmac.compare_digest(str(d["password"]).encode(), DEV_PASSWORD.encode()):
                     HITS.pop("l:" + ip, None)
+                    STORE.journal_ajouter("d", "", ip, True)
                     return self.json({"token": faire_jeton("d"), "role": "d", "nom": "Développeur"})
             else:
                 u = STORE.user_verifier(d.get("code", ""))
+                if u and u.get("exp") and time.time() > u["exp"]:
+                    STORE.journal_ajouter("v", u["id"], ip, False)
+                    return self.json({"erreur": "Ce code a expiré. Demande-en un nouveau à ton développeur."}, 401)
                 if u:
                     HITS.pop("l:" + ip, None)
+                    STORE.journal_ajouter("v", u["id"], ip, True)
                     return self.json({"token": faire_jeton("v", u["id"], u["h"]), "role": "v", "uid": u["id"], "nom": u["nom"]})
             HITS.setdefault("l:" + ip, []).append(time.time())
+            STORE.journal_ajouter("?", "", ip, False)
             time.sleep(0.7)
             return self.json({"erreur": "Code ou mot de passe incorrect."}, 401)
 
@@ -278,6 +506,10 @@ class H(BaseHTTPRequestHandler):
             nom = sauver_image(img, uid) if img else ""
             HITS.setdefault("s:" + uid + a[0], []).append(time.time())
             m = STORE.envoyer(uid, a[0], texte, nom)
+            try:
+                apres_envoi(uid, a[0], texte)
+            except Exception:
+                traceback.print_exc()
             return self.json({"msg": m})
 
         if p == "/api/read":
@@ -287,22 +519,86 @@ class H(BaseHTTPRequestHandler):
             STORE.lire(uid, a[0])
             return self.json({"ok": True})
 
+        if p == "/api/push/sub":
+            s = d.get("sub") or {}
+            k = s.get("keys") or {}
+            ep = str(s.get("endpoint") or "")
+            if not (ep.startswith("https://") and len(ep) < 700 and isinstance(k, dict)
+                    and 10 < len(str(k.get("p256dh") or "")) < 200 and 10 < len(str(k.get("auth") or "")) < 100):
+                raise ValueError("Abonnement invalide.")
+            deja = STORE.push_liste(a[0], a[1])
+            if len(deja) >= 8 and ep not in [x[1].get("endpoint") for x in deja]:
+                raise ValueError("Trop d'appareils enregistrés.")
+            STORE.push_ajouter(a[0], a[1], {"endpoint": ep, "keys": {"p256dh": str(k["p256dh"]), "auth": str(k["auth"])}})
+            return self.json({"ok": True})
+
+        if p == "/api/push/unsub":
+            STORE.push_retirer(str(d.get("endpoint") or ""), a[0], a[1])
+            return self.json({"ok": True})
+
         if a[0] != "d":
             return self.json({"erreur": "Réservé au développeur."}, 403)
+
+        if p == "/api/settings":
+            c = {}
+            if "rappel_h" in d:
+                try:
+                    hh = int(d["rappel_h"])
+                except (TypeError, ValueError):
+                    raise ValueError("Durée invalide.")
+                if hh not in (0, 1, 3, 6, 12, 24):
+                    raise ValueError("Durée invalide.")
+                c["rappel_h"] = hh
+            if "absence_on" in d:
+                c["absence_on"] = bool(d["absence_on"])
+            if "absence_txt" in d:
+                c["absence_txt"] = str(d["absence_txt"] or "").strip()[:300]
+            fin = reglages()
+            fin.update(c)
+            if fin["absence_on"] and not fin["absence_txt"]:
+                raise ValueError("Écris le message d'absence.")
+            STORE.cfg_maj(c)
+            return self.json({"reglages": reglages()})
+
+        if p == "/api/push/test":
+            if not push_dispo():
+                return self.json({"erreur": "Notifications non installées sur le serveur (pywebpush manquant)."}, 400)
+            n, er = _diffuser("d", "", {"title": "DAJ", "body": "Notification test", "tag": "test", "url": "/"})
+            return self.json({"envoyes": n, "erreurs": er})
 
         if p == "/api/users":
             nom = re.sub(r"\s+", " ", str(d.get("nom") or "")).strip()[:60]
             if len(nom) < 2:
                 raise ValueError("Écris le nom de la vendeuse.")
-            uid, code = STORE.user_creer(nom)
+            uid, code = STORE.user_creer(nom, jours_ok(d.get("jours")))
             return self.json({"id": uid, "code": code, "nom": nom})
 
         if p == "/api/users/code":
             uid = str(d.get("uid") or "")[:8]
-            code = STORE.user_nouveau_code(uid)
+            code = STORE.user_nouveau_code(uid, jours_ok(d.get("jours")))
             if not code:
                 return self.json({"erreur": "Introuvable."}, 404)
             return self.json({"code": code})
+
+        if p == "/api/users/update":
+            uid = str(d.get("uid") or "")[:8]
+            f = STORE.user_maj(uid, champs_fiche(d)) if STORE.user(uid) else None
+            if not f:
+                return self.json({"erreur": "Introuvable."}, 404)
+            return self.json({"user": f})
+
+        if p == "/api/broadcast":
+            texte = str(d.get("texte") or "").strip()[:2000]
+            if not texte:
+                raise ValueError("Écris le message.")
+            if len(hits("b:d", 60)) >= 2:
+                return self.json({"erreur": "Une annonce par minute au maximum."}, 429)
+            HITS.setdefault("b:d", []).append(time.time())
+            ids = [u["id"] for u in STORE.users()]
+            for i in ids:
+                STORE.envoyer(i, "d", texte, "")
+                pousser("v", i, "DAJ", texte[:90], "d" + i)
+            return self.json({"envoye": len(ids)})
 
         return self.json({"erreur": "Introuvable."}, 404)
 
@@ -311,5 +607,6 @@ if __name__ == "__main__":
     if not DEV_PASSWORD or len(DEV_PASSWORD) < 8:
         raise SystemExit("Définis DAJ_PASSWORD (8 caractères minimum, 12 conseillé) avant de lancer.")
     STORE = Store()
+    threading.Thread(target=boucle_rappels, daemon=True).start()
     print("DAJ sur le port", PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

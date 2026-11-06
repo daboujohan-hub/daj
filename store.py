@@ -9,7 +9,9 @@ try:
 except Exception:
     FieldFilter = None
 
-USERS, MSGS, IMGS = "daj_users", "daj_msgs", "daj_images"
+USERS, MSGS, IMGS, LOG = "daj_users", "daj_msgs", "daj_images", "daj_log"
+CFG, PUSH = "daj_cfg", "daj_push"  # LOT1_V1
+STATUTS = ("prospect", "test", "active", "pause")
 ALPHA = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 TTL = 120
 
@@ -59,8 +61,20 @@ def make_client():
 
 def _pub(d):
     """Vue d'une vendeuse sans secret."""
-    return {k: d.get(k) for k in ("id", "nom", "created", "n", "last_text", "last_ts", "last_from",
-                                  "unread_dev", "unread_v", "lu_v", "lu_dev")}
+    p = {k: d.get(k) for k in ("id", "nom", "created", "n", "last_text", "last_ts", "last_from",
+                               "unread_dev", "unread_v", "lu_v", "lu_dev", "wa", "ville", "exp")}
+    p["statut"] = d.get("statut") or "prospect"
+    p["muet"] = bool(d.get("muet"))
+    p["tags"] = list(d.get("tags") or [])
+    return p
+
+
+def _fiche(d):
+    """Toute la fiche d'une vendeuse, sans les secrets (pour le développeur)."""
+    p = _pub(d)
+    p["boutique"] = d.get("boutique", "")
+    p["notes"] = d.get("notes", "")
+    return p
 
 
 class Store:
@@ -92,7 +106,7 @@ class Store:
         d = self._tous().get(uid)
         return copy.deepcopy(d) if d else None
 
-    def user_creer(self, nom):
+    def user_creer(self, nom, jours=0):
         if len(self._tous()) >= 300:
             raise Refus("Trop de vendeuses.")
         ts = maintenant()
@@ -100,7 +114,9 @@ class Store:
             uid, secret = _rand(4), _rand(8)
             salt = secrets.token_hex(16)
             d = {"id": uid, "nom": nom, "salt": salt, "h": _hash(secret, salt), "created": ts, "n": 0,
-                 "last_text": "", "last_ts": ts, "last_from": "", "unread_dev": 0, "unread_v": 0, "lu_v": 0, "lu_dev": 0}
+                 "last_text": "", "last_ts": ts, "last_from": "", "unread_dev": 0, "unread_v": 0, "lu_v": 0, "lu_dev": 0,
+                 "wa": "", "ville": "", "boutique": "", "statut": "prospect", "notes": "", "tags": [],
+                 "exp": int(time.time() + jours * 86400) if jours else 0}
             try:
                 self.db.collection(USERS).document(uid).create(d)
             except Exception as e:
@@ -111,16 +127,31 @@ class Store:
             return uid, joli(uid + secret)
         raise Refus("Réessaie.")
 
-    def user_nouveau_code(self, uid):
+    def user_nouveau_code(self, uid, jours=0):
         d = self.user(uid)
         if not d:
             return None
         secret = _rand(8)
         salt = secrets.token_hex(16)
         d["salt"], d["h"] = salt, _hash(secret, salt)
-        self.db.collection(USERS).document(uid).update({"salt": salt, "h": d["h"]})
+        d["exp"] = int(time.time() + jours * 86400) if jours else 0
+        self.db.collection(USERS).document(uid).update({"salt": salt, "h": d["h"], "exp": d["exp"]})
         self._maj(uid, d)
+        self.push_vider(uid)
         return joli(uid + secret)
+
+    def fiche(self, uid):
+        d = self._tous().get(uid)
+        return copy.deepcopy(_fiche(d)) if d else None
+
+    def user_maj(self, uid, champs):
+        d = self.user(uid)
+        if not d:
+            return None
+        self.db.collection(USERS).document(uid).update(champs)
+        d.update(champs)
+        self._maj(uid, d)
+        return copy.deepcopy(_fiche(d))
 
     def user_verifier(self, code):
         """Renvoie la vendeuse si le code est bon. Prend toujours le même temps."""
@@ -145,13 +176,14 @@ class Store:
                 break
         for s in list(_w(self.db.collection(IMGS), "uid", "==", uid).stream()):
             self.db.collection(IMGS).document(s.id).delete()
+        self.push_vider(uid)
         self.db.collection(USERS).document(uid).delete()
         with self._lock:
             self._tous().pop(uid, None)
         return True
 
     # ---------- messages ----------
-    def envoyer(self, uid, de, texte, image):
+    def envoyer(self, uid, de, texte, image, auto=False):
         ref = self.db.collection(USERS).document(uid)
         msgs = self.db.collection(MSGS)
         ts = maintenant()
@@ -165,7 +197,10 @@ class Store:
             seq = int(d.get("n", 0)) + 1
             m = {"k": "%s|%012d" % (uid, seq), "uid": uid, "seq": seq, "de": de, "t": texte, "img": image, "ts": ts}
             maj = {"n": seq, "last_text": (texte[:80] if texte else "Photo"), "last_ts": ts, "last_from": de}
-            if de == "v":
+            if auto:
+                m["auto"] = True
+                maj = {"n": seq, "unread_v": int(d.get("unread_v", 0)) + 1}
+            elif de == "v":
                 maj.update(unread_dev=int(d.get("unread_dev", 0)) + 1, unread_v=0, lu_v=seq)
             else:
                 maj.update(unread_v=int(d.get("unread_v", 0)) + 1, unread_dev=0, lu_dev=seq)
@@ -204,6 +239,109 @@ class Store:
         self.db.collection(USERS).document(uid).update(maj)
         d.update(maj)
         self._maj(uid, d)
+
+    def rechercher(self, uid, mot, limite=30):
+        if uid not in self._tous():
+            return None
+        mot = mot.lower()
+        q = _w(_w(self.db.collection(MSGS), "k", ">=", uid + "|"), "k", "<", uid + "|~").order_by("k").limit(2000)
+        sortie = []
+        for s in q.stream():
+            m = s.to_dict()
+            if mot in (m.get("t") or "").lower():
+                sortie.append({"seq": m["seq"], "t": m["t"], "ts": m["ts"], "de": m["de"]})
+        return sortie[-limite:]
+
+    def tout(self, uid):
+        """Toute la conversation, dans l'ordre (pour l'export)."""
+        if uid not in self._tous():
+            return None
+        q = _w(_w(self.db.collection(MSGS), "k", ">=", uid + "|"), "k", "<", uid + "|~").order_by("k").limit(5000)
+        return [s.to_dict() for s in q.stream()]
+
+    # ---------- reglages et notifications ----------
+    def cfg(self):
+        with self._lock:
+            if getattr(self, "_cfg", None) is None:
+                s = self.db.collection(CFG).document("settings").get()
+                self._cfg = s.to_dict() if s.exists else {}
+            return copy.deepcopy(self._cfg)
+
+    def cfg_maj(self, champs):
+        c = self.cfg()
+        c.update(champs)
+        self.db.collection(CFG).document("settings").set(c)
+        with self._lock:
+            self._cfg = c
+        return copy.deepcopy(c)
+
+    def vapid(self):
+        """Cles VAPID (identite des notifications). Creees une fois, gardees dans Firestore."""
+        import base64
+        pr, pu = os.environ.get("VAPID_PRIVATE", "").strip(), os.environ.get("VAPID_PUBLIC", "").strip()
+        if pr and pu:
+            return pr, pu
+        with self._lock:
+            if getattr(self, "_vap", None):
+                return self._vap
+            ref = self.db.collection(CFG).document("vapid")
+            s = ref.get()
+            if s.exists:
+                d = s.to_dict()
+            else:
+                from cryptography.hazmat.primitives.asymmetric import ec
+                from cryptography.hazmat.primitives import serialization as ser
+                k = ec.generate_private_key(ec.SECP256R1())
+
+                def b(x):
+                    return base64.urlsafe_b64encode(x).rstrip(b"=").decode()
+                d = {"priv": b(k.private_numbers().private_value.to_bytes(32, "big")),
+                     "pub": b(k.public_key().public_bytes(ser.Encoding.X962, ser.PublicFormat.UncompressedPoint))}
+                try:
+                    ref.create(d)
+                except Exception:
+                    d = ref.get().to_dict()
+            self._vap = (d["priv"], d["pub"])
+            return self._vap
+
+    def push_ajouter(self, role, uid, sub):
+        cid = hashlib.sha256(sub["endpoint"].encode()).hexdigest()[:32]
+        self.db.collection(PUSH).document(cid).set({"role": role, "uid": uid or "", "sub": sub, "ts": maintenant()})
+
+    def push_retirer(self, endpoint, role, uid):
+        ref = self.db.collection(PUSH).document(hashlib.sha256(endpoint.encode()).hexdigest()[:32])
+        s = ref.get()
+        if s.exists:
+            d = s.to_dict()
+            if d.get("role") == role and d.get("uid", "") == (uid or ""):
+                ref.delete()
+                return True
+        return False
+
+    def push_liste(self, role, uid=""):
+        q = _w(self.db.collection(PUSH), "role", "==", role)
+        if role == "v":
+            q = _w(q, "uid", "==", uid)
+        return [(s.id, s.to_dict()["sub"]) for s in q.stream()]
+
+    def push_supprimer(self, cid):
+        self.db.collection(PUSH).document(cid).delete()
+
+    def push_vider(self, uid):
+        for s in list(_w(self.db.collection(PUSH), "uid", "==", uid).stream()):
+            self.db.collection(PUSH).document(s.id).delete()
+
+    # ---------- journal ----------
+    def journal_ajouter(self, role, uid, ip, ok):
+        try:
+            self.db.collection(LOG).document(secrets.token_hex(8)).set(
+                {"ts": maintenant(), "role": role, "uid": uid or "", "ip": ip or "", "ok": bool(ok)})
+        except Exception:
+            pass
+
+    def journal(self, n=100):
+        q = self.db.collection(LOG).order_by("ts", direction=firestore.Query.DESCENDING).limit(n)
+        return [s.to_dict() for s in q.stream()]
 
     # ---------- photos ----------
     def image_enregistrer(self, nom, uid, mime, data):

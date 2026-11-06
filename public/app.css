@@ -65,7 +65,7 @@ input,textarea{font:inherit;color:inherit}
 
 /* fenêtres */
 .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;justify-content:center;z-index:50}
-.sheet{background:#fff;width:100%;max-width:480px;border-radius:20px 20px 0 0;padding:20px 18px calc(20px + var(--sa));display:flex;flex-direction:column;gap:12px}
+.sheet{background:#fff;width:100%;max-width:480px;max-height:90vh;overflow-y:auto;border-radius:20px 20px 0 0;padding:20px 18px calc(20px + var(--sa));display:flex;flex-direction:column;gap:12px}
 .sheet h2{font-size:1.15rem}
 .sheet p{color:var(--soft);font-size:.92rem}
 .sheet input{height:50px;border:2px solid #d9e2dc;border-radius:14px;padding:0 14px;font-size:1.05rem;outline:none}
@@ -85,3 +85,21 @@ input,textarea{font:inherit;color:inherit}
 @keyframes dr{to{stroke-dashoffset:0}}
 @keyframes fin{from{opacity:0}to{opacity:1}}
 @media (prefers-reduced-motion:reduce){.ok *,.shake{animation-duration:.01s!important;animation-delay:0s!important}}
+
+/* lot 1 : gestion des vendeuses */
+.sb{padding:8px 12px;background:#fff;border-bottom:1px solid #eef1ee}
+.srch{width:100%;height:42px;border:0;border-radius:21px;background:#f0f3f1;padding:0 16px;outline:none}
+.sel{height:50px;border:2px solid #d9e2dc;border-radius:14px;padding:0 12px;background:#fff;font-size:1rem}
+.ta{border:2px solid #d9e2dc;border-radius:14px;padding:12px 14px;font-size:1rem;outline:none;resize:vertical}
+.ta:focus{border-color:var(--g)}
+.row .m .tg{font-size:.74rem;margin-top:2px}
+.st-prospect{color:#6b7a70!important}.st-test{color:#b45309!important}.st-active{color:#15803d!important;font-weight:700}.st-pause{color:#b42318!important}
+.lgs{display:flex;flex-direction:column;gap:6px;max-height:50vh;overflow-y:auto}
+.lg{display:flex;flex-direction:column;gap:2px;padding:9px 12px;border-radius:12px;background:#f4f7f5}
+.lg b{font-size:.9rem}.lg span{font-size:.82rem;color:var(--soft);overflow-wrap:anywhere}
+.lg.ko b{color:var(--bad)}.lg.ok b{color:var(--g)}
+
+.politique{display:block;margin-top:18px;font-size:13px;color:inherit;opacity:.7;text-align:center}
+
+/* LOT1_V1 */
+.auto{font-size:.68rem;color:var(--soft);font-style:italic;margin-bottom:2px}
