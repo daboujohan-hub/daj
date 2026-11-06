@@ -183,7 +183,7 @@ class Store:
         return True
 
     # ---------- messages ----------
-    def envoyer(self, uid, de, texte, image, auto=False):
+    def envoyer(self, uid, de, texte, image, auto=False, cite=None):
         ref = self.db.collection(USERS).document(uid)
         msgs = self.db.collection(MSGS)
         ts = maintenant()
@@ -197,6 +197,8 @@ class Store:
             seq = int(d.get("n", 0)) + 1
             m = {"k": "%s|%012d" % (uid, seq), "uid": uid, "seq": seq, "de": de, "t": texte, "img": image, "ts": ts}
             maj = {"n": seq, "last_text": (texte[:80] if texte else "Photo"), "last_ts": ts, "last_from": de}
+            if cite:
+                m.update(cite)
             if auto:
                 m["auto"] = True
                 maj = {"n": seq, "unread_v": int(d.get("unread_v", 0)) + 1}
@@ -239,6 +241,98 @@ class Store:
         self.db.collection(USERS).document(uid).update(maj)
         d.update(maj)
         self._maj(uid, d)
+
+    # LOT2A_V1 : citation, modification, suppression, reactions, epingles
+    def msg_get(self, uid, seq):
+        s = self.db.collection(MSGS).document("%s_%012d" % (uid, seq)).get()
+        return s.to_dict() if s.exists else None
+
+    def msg_modifier(self, uid, seq, qui, action, valeur=None):
+        """action : edit, del ou rx. qui : 'd' ou 'v'. Renvoie le message a jour, ou None."""
+        ref_u = self.db.collection(USERS).document(uid)
+        ref_m = self.db.collection(MSGS).document("%s_%012d" % (uid, seq))
+
+        @firestore.transactional
+        def run(tx):
+            su = ref_u.get(transaction=tx)
+            sm = ref_m.get(transaction=tx)
+            if not su.exists or not sm.exists:
+                return None
+            d, m = su.to_dict(), sm.to_dict()
+            if m.get("del"):
+                raise Refus("Ce message est supprimé.")
+            if action in ("edit", "del") and m.get("de") != qui:
+                raise Refus("Tu peux modifier seulement tes messages.")
+            if action == "edit":
+                age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.strptime(m["ts"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)).total_seconds()
+                if age > 86400:
+                    raise Refus("Ce message est trop ancien pour être modifié.")
+                ch = {"t": valeur, "ed": maintenant()}
+            elif action == "del":
+                ch = {"t": "", "img": "", "del": True, "rx": {}, "re": 0, "re_t": "", "re_de": ""}
+            else:
+                rx = dict(m.get("rx") or {})
+                if valeur:
+                    rx[qui] = valeur
+                else:
+                    rx.pop(qui, None)
+                ch = {"rx": rx}
+            mv = int(d.get("mv", 0)) + 1
+            mods = [x for x in (d.get("mods") or []) if x.get("s") != seq][-59:] + [{"s": seq, "v": mv}]
+            maj = {"mv": mv, "mods": mods}
+            if seq == int(d.get("n", 0)) and action in ("edit", "del"):
+                maj["last_text"] = "Message supprimé" if action == "del" else valeur[:80]
+            if action == "del" and seq in (d.get("pins") or []):
+                maj["pins"] = [p for p in d["pins"] if p != seq]
+            tx.update(ref_m, ch)
+            tx.update(ref_u, maj)
+            m.update(ch)
+            d.update(maj)
+            return m, d
+
+        r = run(self.db.transaction())
+        if not r:
+            return None
+        m, d = r
+        self._maj(uid, d)
+        return m
+
+    def modifs(self, uid, depuis):
+        """Messages modifies (modifies, supprimes, reactions) depuis la version donnee."""
+        d = self._tous().get(uid) or {}
+        out = []
+        for x in d.get("mods") or []:
+            if x.get("v", 0) > depuis:
+                m = self.msg_get(uid, int(x["s"]))
+                if m:
+                    out.append(m)
+        return out
+
+    def epingler(self, uid, seq, on):
+        d = self.user(uid)
+        if not d:
+            return None
+        pins = [p for p in (d.get("pins") or []) if p != seq]
+        if on:
+            m = self.msg_get(uid, seq)
+            if not m or m.get("del"):
+                raise Refus("Message introuvable.")
+            if len(pins) >= 5:
+                raise Refus("5 messages épinglés au maximum.")
+            pins.append(seq)
+        self.db.collection(USERS).document(uid).update({"pins": pins})
+        d["pins"] = pins
+        self._maj(uid, d)
+        return pins
+
+    def pins_msgs(self, uid):
+        d = self._tous().get(uid) or {}
+        out = []
+        for s in d.get("pins") or []:
+            m = self.msg_get(uid, int(s))
+            if m and not m.get("del"):
+                out.append(m)
+        return out
 
     def rechercher(self, uid, mot, limite=30):
         if uid not in self._tous():
@@ -346,6 +440,9 @@ class Store:
     # ---------- photos ----------
     def image_enregistrer(self, nom, uid, mime, data):
         self.db.collection(IMGS).document(nom).set({"uid": uid, "mime": mime, "data": data, "ts": maintenant()})
+
+    def image_supprimer(self, nom):
+        self.db.collection(IMGS).document(nom).delete()
 
     def image_lire(self, nom):
         s = self.db.collection(IMGS).document(nom).get()

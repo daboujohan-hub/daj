@@ -254,6 +254,8 @@
   function vueChat(o) {
     stopTimers(); root.innerHTML = '';
     var seen = {}, dernier = 0, lu_v = 0, lu_dev = 0, jourPrec = '', img = '', enCours = false;
+    var mv = 0, msgs = {}, els = {}, citer = null, pinsSeq = [], dernierTyping = 0;
+    var sousEl = h('small', {}, o.sous || '');
     var zone = h('div', { class: 'chat' });
     var vide = h('div', { class: 'vide' }, 'Écris ton premier message ici.');
     var ta = h('textarea', { rows: '1', placeholder: 'Écris un message', maxlength: '2000' });
@@ -275,6 +277,20 @@
         if (j !== jourPrec) { zone.appendChild(h('div', { class: 'day' }, j)); jourPrec = j; }
       }
       var b = h('div', { class: 'b' + (moi ? ' me' : '') + (pend ? ' pend' : ''), 'data-seq': m.seq || '' });
+      remplir(b, m, pend);
+      if (m.seq && !pend) {
+        msgs[m.seq] = m; els[m.seq] = b;
+        b.addEventListener('click', function (e) { if (e.target.tagName !== 'IMG' && !e.target.closest('.quote')) actions(msgs[m.seq]); });
+      }
+      zone.appendChild(b);
+      return b;
+    }
+    function remplir(b, m, pend) {
+      b.innerHTML = '';
+      if (m.re) {
+        b.appendChild(h('div', { class: 'quote', onclick: function (e) { e.stopPropagation(); aller(m.re); } },
+          h('b', {}, m.re_de === o.moi ? 'Toi' : (o.moi === 'v' ? 'DAJ' : o.titre)), h('span', {}, m.re_t || 'Photo')));
+      }
       if (m.img) {
         var src = m.img.indexOf('data:') === 0 ? m.img : '/img/' + m.img + '?t=' + encodeURIComponent(S.tok);
         var im = h('img', { src: src, alt: 'Photo', loading: 'lazy' });
@@ -285,10 +301,120 @@
         b.appendChild(im);
       }
       if (m.auto) b.appendChild(h('div', { class: 'auto' }, 'Message automatique'));
-      if (m.t) b.appendChild(document.createTextNode(m.t));
-      b.appendChild(h('span', { class: 'mt' }, (m.ts ? heure(m.ts) : 'envoi…') + (m.ts ? vu(m) : '')));
-      zone.appendChild(b);
-      return b;
+      if (m.del) b.appendChild(h('i', { class: 'del' }, 'Message supprimé'));
+      else if (m.t) b.appendChild(document.createTextNode(m.t));
+      var rx = m.rx ? Object.keys(m.rx).map(function (k) { return m.rx[k]; }) : [];
+      if (rx.length) b.appendChild(h('div', { class: 'rx' }, rx.join(' ')));
+      b.appendChild(h('span', { class: 'mt' }, (pinsSeq.indexOf(m.seq) >= 0 ? '📌 ' : '') + (m.ts ? heure(m.ts) : 'envoi…') + (m.ed && !m.del ? ' · modifié' : '') + (m.ts ? vu(m) : '')));
+    }
+    function maj(m) {
+      msgs[m.seq] = m;
+      if (els[m.seq]) remplir(els[m.seq], m, false);
+      ticks();
+    }
+    function aller(seq) {
+      var b = els[seq];
+      if (!b) { toast('Message plus ancien'); return; }
+      b.scrollIntoView({ block: 'center' }); b.classList.add('flash');
+      setTimeout(function () { b.classList.remove('flash'); }, 1300);
+    }
+    function nomDe(m) { return m.de === o.moi ? 'Toi' : (o.moi === 'v' ? 'DAJ' : o.titre); }
+    function corps(x) { if (o.uid) x.uid = o.uid; return x; }
+    function reagir(m, e) {
+      api('/api/msg/react', { body: corps({ seq: m.seq, emoji: e }) }).then(function (r) { if (r.ok) maj(r.d.msg); else toast(r.d.erreur || 'Erreur'); });
+    }
+    function supprimer(m) {
+      api('/api/msg/del', { body: corps({ seq: m.seq }) }).then(function (r) { if (r.ok) maj(r.d.msg); else toast(r.d.erreur || 'Erreur'); });
+    }
+    function modifier(m) {
+      var t = h('textarea', { class: 'ta', rows: '4', maxlength: '2000' }); t.value = m.t;
+      var fermer = feuille([h('h2', {}, 'Modifier le message'), t,
+        h('button', { class: 'btn', onclick: function () {
+          var v = t.value.trim(); if (!v) { toast('Écris le message'); return; }
+          api('/api/msg/edit', { body: corps({ seq: m.seq, texte: v }) }).then(function (r) { if (r.ok) { fermer(); maj(r.d.msg); } else toast(r.d.erreur || 'Erreur'); });
+        } }, 'Enregistrer'),
+        h('button', { class: 'btn lt', onclick: function () { fermer(); } }, 'Annuler')]);
+      setTimeout(function () { t.focus(); }, 60);
+    }
+    function epingler(m, on) {
+      api('/api/pin', { body: { uid: o.uid, seq: m.seq, on: on } }).then(function (r) {
+        if (r.ok) { pinsChange(r.d.pins || []); toast(on ? 'Message épinglé' : 'Message détaché'); } else toast(r.d.erreur || 'Erreur');
+      });
+    }
+    function actions(m) {
+      if (!m || !m.seq || m.del) return;
+      var fermer, ligne = h('div', { class: 'emo' });
+      ['👍', '✅', '🙏', '😊'].forEach(function (e) {
+        var mien = m.rx && m.rx[o.moi] === e;
+        ligne.appendChild(h('button', { class: mien ? 'on' : '', onclick: function () { fermer(); reagir(m, mien ? '' : e); } }, e));
+      });
+      var l = [ligne, h('button', { class: 'btn lt', onclick: function () { fermer(); citer = m; montrerCiter(); ta.focus(); } }, 'Répondre')];
+      if (m.t) l.push(h('button', { class: 'btn lt', onclick: function () { fermer(); copier(m.t); } }, 'Copier'));
+      if (o.moi === 'd') {
+        var pin = pinsSeq.indexOf(m.seq) >= 0;
+        l.push(h('button', { class: 'btn lt', onclick: function () { fermer(); epingler(m, !pin); } }, pin ? 'Détacher' : 'Épingler'));
+      }
+      if (m.de === o.moi && m.t) l.push(h('button', { class: 'btn lt', onclick: function () { fermer(); modifier(m); } }, 'Modifier'));
+      if (m.de === o.moi) l.push(h('button', { class: 'btn rd', onclick: function () { fermer(); if (confirm('Supprimer ce message ?')) supprimer(m); } }, 'Supprimer'));
+      l.push(h('button', { class: 'btn lt', onclick: function () { fermer(); } }, 'Fermer'));
+      fermer = feuille(l);
+    }
+    // LOT2A_V1
+    var pinbar = h('div', { class: 'pinbar hide' });
+    var replybar = h('div', { class: 'replybar hide' });
+    function montrerCiter() {
+      replybar.innerHTML = '';
+      if (!citer) { replybar.classList.add('hide'); return; }
+      replybar.classList.remove('hide');
+      replybar.appendChild(h('div', { class: 'qt' }, h('b', {}, nomDe(citer)), h('span', {}, citer.t || 'Photo')));
+      replybar.appendChild(h('button', { 'aria-label': 'Annuler', onclick: function () { citer = null; montrerCiter(); } }, '✕'));
+    }
+    function pinsChange(l) {
+      if (JSON.stringify(l) === JSON.stringify(pinsSeq)) return;
+      var avant = pinsSeq; pinsSeq = l.slice();
+      avant.concat(l).forEach(function (s) { if (msgs[s] && els[s]) remplir(els[s], msgs[s], false); });
+      pinbar.innerHTML = '';
+      if (!pinsSeq.length) { pinbar.classList.add('hide'); return; }
+      pinbar.classList.remove('hide');
+      pinbar.appendChild(document.createTextNode('📌 ' + pinsSeq.length + (pinsSeq.length > 1 ? ' messages épinglés' : ' message épinglé') + ' · Voir'));
+      ticks();
+    }
+    pinbar.addEventListener('click', function () {
+      api('/api/pins' + (o.uid ? '?uid=' + encodeURIComponent(o.uid) : '')).then(function (r) {
+        if (!r.ok) { toast(r.d.erreur || 'Erreur'); return; }
+        var l = h('div', { class: 'lgs' });
+        (r.d.msgs || []).forEach(function (m) {
+          l.appendChild(h('div', { class: 'lg', onclick: function () { fermer(); aller(m.seq); } },
+            h('b', {}, nomDe(m) + ' · ' + jour(m.ts) + ' ' + heure(m.ts)), h('span', {}, m.t || 'Photo')));
+        });
+        if (!l.childNodes.length) l.appendChild(h('div', { class: 'vide' }, 'Rien d\'épinglé.'));
+        var fermer = feuille([h('h2', {}, 'Messages épinglés'), l, h('button', { class: 'btn lt', onclick: function () { fermer(); } }, 'Fermer')]);
+      });
+    });
+    var eclair = h('button', { class: 'cam', 'aria-label': 'Réponses rapides', onclick: function () { rapides(); } }, '⚡');
+    function rapides() {
+      api('/api/settings').then(function (r) {
+        if (!r.ok) { toast(r.d.erreur || 'Erreur'); return; }
+        var l = r.d.reglages.rapides || [];
+        var fermer = feuille([h('h2', {}, 'Réponses rapides')].concat(l.map(function (t) {
+          return h('button', { class: 'btn lt rp', onclick: function () {
+            fermer(); ta.value = (ta.value ? ta.value + ' ' : '') + t; ta.dispatchEvent(new Event('input')); ta.focus();
+          } }, t);
+        }), [h('button', { class: 'btn', onclick: function () { fermer(); gererRapides(l); } }, 'Modifier la liste'),
+          h('button', { class: 'btn lt', onclick: function () { fermer(); } }, 'Fermer')]));
+      });
+    }
+    function gererRapides(l) {
+      var t = h('textarea', { class: 'ta', rows: '8', maxlength: '2400', placeholder: 'Une réponse par ligne' }); t.value = l.join('\n');
+      var fermer = feuille([h('h2', {}, 'Mes réponses rapides'), h('p', {}, 'Une réponse par ligne (12 maximum).'), t,
+        h('button', { class: 'btn', onclick: function () {
+          api('/api/settings', { body: { rapides: t.value.split('\n') } }).then(function (r) { if (r.ok) { fermer(); toast('Enregistré'); } else toast(r.d.erreur || 'Erreur'); });
+        } }, 'Enregistrer'),
+        h('button', { class: 'btn lt', onclick: function () { fermer(); } }, 'Annuler')]);
+    }
+    function ecrire() {
+      var n = Date.now(); if (n - dernierTyping < 3000) return; dernierTyping = n;
+      api('/api/typing', { body: o.uid ? { uid: o.uid } : {}, nolog: true });
     }
     function ajouter(l) {
       var coll = proche();
@@ -307,11 +433,14 @@
       });
     }
     function marquer() { if (!document.hidden) api('/api/read', { body: o.uid ? { uid: o.uid } : {} }); }
-    function q(apres) { return '/api/msgs?apres=' + apres + (o.uid ? '&uid=' + encodeURIComponent(o.uid) : ''); }
+    function q(apres) { return '/api/msgs?apres=' + apres + '&mv=' + mv + (o.uid ? '&uid=' + encodeURIComponent(o.uid) : ''); }
     function charger(apres, premier) {
       return api(q(apres)).then(function (r) {
         if (!r.ok) { if (premier) toast(r.d.erreur || 'Erreur'); return; }
         lu_v = r.d.lu_v; lu_dev = r.d.lu_dev;
+        (r.d.maj || []).forEach(maj); mv = r.d.mv || mv;
+        pinsChange(r.d.pins || []);
+        sousEl.textContent = r.d.ecrit ? 'écrit…' : (o.sous || '');
         var nouveaux = (r.d.msgs || []).filter(function (m) { return !seen[m.seq]; });
         ajouter(r.d.msgs || []); ticks();
         if (!premier && !o.muet && nouveaux.some(function (m) { return m.de !== o.moi; })) bip();
@@ -348,19 +477,20 @@
       redim(f, function (d) { img = d; montrerPrev(); });
     });
     cam.addEventListener('click', function () { fic.click(); });
-    ta.addEventListener('input', function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 130) + 'px'; });
+    ta.addEventListener('input', function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 130) + 'px'; ecrire(); });
     function envoyer() {
       var t = ta.value.trim(), im = img;
       if ((!t && !im) || enCours) return;
       enCours = true; env.disabled = true;
       if (vide.parentNode) vide.parentNode.removeChild(vide);
-      var p = bulle({ de: o.moi, t: t, img: im }, true); bas();
-      ta.value = ''; ta.style.height = 'auto'; img = ''; montrerPrev();
-      var body = { texte: t, image: im || undefined }; if (o.uid) body.uid = o.uid;
+      var c0 = citer;
+      var p = bulle({ de: o.moi, t: t, img: im, re: c0 ? c0.seq : 0, re_t: c0 ? (c0.t || 'Photo').slice(0, 80) : '', re_de: c0 ? c0.de : '' }, true); bas();
+      ta.value = ''; ta.style.height = 'auto'; img = ''; montrerPrev(); citer = null; montrerCiter();
+      var body = { texte: t, image: im || undefined, re: c0 ? c0.seq : undefined }; if (o.uid) body.uid = o.uid;
       api('/api/send', { body: body }).then(function (r) {
         enCours = false; env.disabled = false;
         if (p.parentNode) p.parentNode.removeChild(p);
-        if (!r.ok) { toast(r.d.erreur || 'Pas envoyé'); ta.value = t; img = im; montrerPrev(); if (!dernier) zone.appendChild(vide); return; }
+        if (!r.ok) { toast(r.d.erreur || 'Pas envoyé'); ta.value = t; img = im; citer = c0; montrerPrev(); montrerCiter(); if (!dernier) zone.appendChild(vide); return; }
         ajouter([r.d.msg]); bas();
       });
     }
@@ -369,14 +499,14 @@
     var tete = h('div', { class: 'bar' },
       o.retour ? h('button', { class: 'ib', 'aria-label': 'Retour', onclick: o.retour }, '←') : null,
       h('div', { class: 'av' }, o.moi === 'v' ? 'D' : initiale(o.titre)),
-      h('div', { class: 't' }, h('b', {}, o.titre), h('small', {}, o.sous || '')),
+      h('div', { class: 't' }, h('b', {}, o.titre), sousEl),
       o.cloche ? h('button', { class: 'ib', 'aria-label': 'Notifications', onclick: o.cloche }, '🔔') : null,
       o.menu ? h('button', { class: 'ib', 'aria-label': 'Menu', onclick: o.menu }, '⋮') : null,
       o.quitter ? h('button', { class: 'ib', 'aria-label': 'Quitter', onclick: o.quitter }, '⎋') : null);
-    root.appendChild(tete); root.appendChild(zone); root.appendChild(prev);
-    root.appendChild(h('div', { class: 'compose' }, cam, fic, ta, env));
+    root.appendChild(tete); root.appendChild(pinbar); root.appendChild(zone); root.appendChild(prev); root.appendChild(replybar);
+    root.appendChild(h('div', { class: 'compose' }, o.moi === 'd' ? eclair : null, cam, fic, ta, env));
     charger(0, true);
-    timers.push(setInterval(function () { if (!document.hidden) charger(dernier, false); }, 4000));
+    timers.push(setInterval(function () { if (!document.hidden) charger(dernier, false); }, 2500));
     document.onvisibilitychange = function () { if (!document.hidden) { charger(dernier, false); marquer(); } };
   }
 

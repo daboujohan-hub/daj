@@ -101,5 +101,23 @@ input,textarea{font:inherit;color:inherit}
 
 .politique{display:block;margin-top:18px;font-size:13px;color:inherit;opacity:.7;text-align:center}
 
+/* LOT2A_V1 */
+.quote{border-left:3px solid var(--g);background:rgba(0,0,0,.06);border-radius:6px;padding:4px 8px;margin-bottom:4px;font-size:.82rem;cursor:pointer}
+.quote b{display:block;font-size:.74rem;color:var(--g)}
+.quote span{display:block;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.b .del{color:var(--soft)}
+.b .rx{display:inline-block;margin-top:2px;background:#fff;border-radius:10px;padding:0 6px;font-size:.9rem;box-shadow:0 1px 2px rgba(0,0,0,.15)}
+.b.flash{outline:2px solid var(--g)}
+.pinbar{padding:7px 14px;background:#fff8e1;border-bottom:1px solid #f0e2b0;font-size:.85rem;cursor:pointer}
+.replybar{display:flex;align-items:center;gap:10px;padding:6px 12px;background:#f4f1ea;border-top:1px solid #e3ded3}
+.replybar .qt{flex:1;min-width:0;border-left:3px solid var(--g);padding-left:8px}
+.replybar b{display:block;font-size:.74rem;color:var(--g)}
+.replybar span{display:block;color:var(--soft);font-size:.84rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.replybar button{font-size:1.2rem;color:var(--soft);padding:8px}
+.emo{display:flex;gap:6px}
+.emo button{flex:1;height:48px;border-radius:14px;background:var(--gl);font-size:1.4rem}
+.emo button.on{outline:2px solid var(--g)}
+.btn.rp{text-align:left;padding:10px 14px;height:auto;min-height:44px;line-height:1.3}
+
 /* LOT1_V1 */
 .auto{font-size:.68rem;color:var(--soft);font-style:italic;margin-bottom:2px}

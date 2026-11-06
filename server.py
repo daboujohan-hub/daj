@@ -85,8 +85,12 @@ def sauver_image(data_url, uid):
 
 # LOT1_V1 : notifications, rappels, message d'absence
 DEFAUT_CFG = {"rappel_h": 3, "absence_on": False,
-              "absence_txt": "Bonjour ! Je suis indisponible pour le moment. Je réponds à tes messages dès que possible."}
+              "absence_txt": "Bonjour ! Je suis indisponible pour le moment. Je réponds à tes messages dès que possible.",
+              "rapides": ["Envoie-moi tes photos.", "C'est corrigé, tu peux vérifier.", "Je m'en occupe aujourd'hui.",
+                          "Peux-tu préciser le prix ?", "Merci, bien reçu."]}
 FMT = "%Y-%m-%d %H:%M:%S"
+EMOJIS = ("👍", "✅", "🙏", "😊")
+TYPING = {}
 
 
 def reglages():
@@ -245,7 +249,7 @@ def texte_export(nom, msgs):
     l = ["Conversation DAJ avec " + nom, "Export du " + time.strftime("%d/%m/%Y %H:%M UTC", time.gmtime()), ""]
     for m in msgs:
         qui = "Développeur" if m["de"] == "d" else nom
-        corps = (m.get("t") or "") + (" [photo]" if m.get("img") else "")
+        corps = "[message supprimé]" if m.get("del") else (m.get("t") or "") + (" [photo]" if m.get("img") else "")
         l.append("[%s] %s : %s" % (m["ts"], qui, corps.strip()))
     return "\n".join(l) + "\n"
 
@@ -357,6 +361,14 @@ class H(BaseHTTPRequestHandler):
             noms = {u["id"]: u["nom"] for u in STORE.users()}
             l = [dict(e, nom=noms.get(e.get("uid"), "")) for e in STORE.journal(100)]
             return self.json({"log": l})
+        if p == "/api/pins":
+            a = self.auth()
+            if not a:
+                return self.json({"erreur": "Connexion nécessaire."}, 401)
+            uid = self.cible(a, q)
+            if not uid:
+                return self.json({"erreur": "Conversation introuvable."}, 404)
+            return self.json({"msgs": STORE.pins_msgs(uid)})
         if p == "/api/search":
             a = self.auth()
             if not a:
@@ -400,7 +412,14 @@ class H(BaseHTTPRequestHandler):
                 apres = 0
             l = STORE.messages(uid, apres)
             d = STORE.user(uid) or {}
-            return self.json({"msgs": l or [], "n": d.get("n", 0), "lu_v": d.get("lu_v", 0), "lu_dev": d.get("lu_dev", 0), "nom": d.get("nom", "")})
+            try:
+                mv = max(0, int(q.get("mv", 0)))
+            except ValueError:
+                mv = 0
+            autre = "v" if a[0] == "d" else "d"
+            return self.json({"msgs": l or [], "n": d.get("n", 0), "lu_v": d.get("lu_v", 0), "lu_dev": d.get("lu_dev", 0), "nom": d.get("nom", ""),
+                              "mv": d.get("mv", 0), "maj": STORE.modifs(uid, mv) if (mv or apres) else [], "pins": list(d.get("pins") or []),
+                              "ecrit": time.time() - TYPING.get((uid, autre), 0) < 6})
         m = re.match(r"^/img/([0-9a-f]{24}\.(?:jpg|png|webp))$", p)
         if m:
             a = self.auth()
@@ -503,9 +522,19 @@ class H(BaseHTTPRequestHandler):
             img = d.get("image")
             if not texte and not img:
                 raise ValueError("Message vide.")
+            cite = None
+            if d.get("re"):
+                try:
+                    rs = int(d["re"])
+                except (TypeError, ValueError):
+                    raise ValueError("Réponse invalide.")
+                orig = STORE.msg_get(uid, rs)
+                if not orig or orig.get("del"):
+                    raise ValueError("Le message auquel tu réponds n'existe plus.")
+                cite = {"re": rs, "re_de": orig["de"], "re_t": (orig.get("t") or "Photo")[:80]}
             nom = sauver_image(img, uid) if img else ""
             HITS.setdefault("s:" + uid + a[0], []).append(time.time())
-            m = STORE.envoyer(uid, a[0], texte, nom)
+            m = STORE.envoyer(uid, a[0], texte, nom, cite=cite)
             try:
                 apres_envoi(uid, a[0], texte)
             except Exception:
@@ -536,8 +565,55 @@ class H(BaseHTTPRequestHandler):
             STORE.push_retirer(str(d.get("endpoint") or ""), a[0], a[1])
             return self.json({"ok": True})
 
+        if p == "/api/typing":
+            uid = self.cible(a, d)
+            if uid:
+                TYPING[(uid, a[0])] = time.time()
+            return self.json({"ok": True})
+
+        if p in ("/api/msg/edit", "/api/msg/del", "/api/msg/react"):
+            uid = self.cible(a, d)
+            if not uid:
+                return self.json({"erreur": "Conversation introuvable."}, 404)
+            if len(hits("e:" + uid + a[0], 60)) >= 60:
+                return self.json({"erreur": "Doucement, réessaie dans une minute."}, 429)
+            HITS.setdefault("e:" + uid + a[0], []).append(time.time())
+            try:
+                seq = int(d.get("seq"))
+            except (TypeError, ValueError):
+                raise ValueError("Message invalide.")
+            if p == "/api/msg/edit":
+                texte = str(d.get("texte") or "").strip()[:2000]
+                if not texte:
+                    raise ValueError("Écris le message.")
+                m = STORE.msg_modifier(uid, seq, a[0], "edit", texte)
+            elif p == "/api/msg/del":
+                avant = STORE.msg_get(uid, seq)
+                m = STORE.msg_modifier(uid, seq, a[0], "del")
+                if m and avant and avant.get("img"):
+                    STORE.image_supprimer(avant["img"])
+                    IMG_CACHE.pop(avant["img"], None)
+            else:
+                e = str(d.get("emoji") or "")
+                if e and e not in EMOJIS:
+                    raise ValueError("Réaction inconnue.")
+                m = STORE.msg_modifier(uid, seq, a[0], "rx", e)
+            if not m:
+                return self.json({"erreur": "Message introuvable."}, 404)
+            return self.json({"msg": m})
+
         if a[0] != "d":
             return self.json({"erreur": "Réservé au développeur."}, 403)
+
+        if p == "/api/pin":
+            uid = self.cible(a, d)
+            if not uid:
+                return self.json({"erreur": "Conversation introuvable."}, 404)
+            try:
+                seq = int(d.get("seq"))
+            except (TypeError, ValueError):
+                raise ValueError("Message invalide.")
+            return self.json({"pins": STORE.epingler(uid, seq, bool(d.get("on")))})
 
         if p == "/api/settings":
             c = {}
@@ -553,6 +629,9 @@ class H(BaseHTTPRequestHandler):
                 c["absence_on"] = bool(d["absence_on"])
             if "absence_txt" in d:
                 c["absence_txt"] = str(d["absence_txt"] or "").strip()[:300]
+            if "rapides" in d:
+                r = d["rapides"] if isinstance(d["rapides"], list) else []
+                c["rapides"] = [propre(x, 200) for x in r if propre(x, 200)][:12]
             fin = reglages()
             fin.update(c)
             if fin["absence_on"] and not fin["absence_txt"]:
