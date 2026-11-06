@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 cle-firebase.json
 *.json.key
+.sauvegardes/
+__pycache__/
