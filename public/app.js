@@ -260,9 +260,12 @@
     var vide = h('div', { class: 'vide' }, 'Écris ton premier message ici.');
     var ta = h('textarea', { rows: '1', placeholder: 'Écris un message', maxlength: '2000' });
     var prev = h('div', { class: 'prev hide' });
-    var fic = h('input', { type: 'file', accept: 'image/*', class: 'hide' });
+    var fic = h('input', { type: 'file', accept: 'image/*', multiple: '', class: 'hide' });
     var env = h('button', { class: 'send', 'aria-label': 'Envoyer' }, '➤');
-    var cam = h('button', { class: 'cam', 'aria-label': 'Photo' }, '📷');
+    var cam = h('button', { class: 'cam', 'aria-label': 'Joindre' }, '📎');
+    var mic = h('button', { class: 'send', 'aria-label': 'Message vocal' }, '🎤');
+    var recBar = h('div', { class: 'recbar hide' });
+    var rec = null; // LOT2B_V1
     function proche() { return zone.scrollHeight - zone.scrollTop - zone.clientHeight < 120; }
     function bas() { zone.scrollTop = zone.scrollHeight; }
     function vu(m) {
@@ -280,7 +283,7 @@
       remplir(b, m, pend);
       if (m.seq && !pend) {
         msgs[m.seq] = m; els[m.seq] = b;
-        b.addEventListener('click', function (e) { if (e.target.tagName !== 'IMG' && !e.target.closest('.quote')) actions(msgs[m.seq]); });
+        b.addEventListener('click', function (e) { if (e.target.tagName !== 'IMG' && e.target.tagName !== 'AUDIO' && !e.target.closest('a') && !e.target.closest('.quote')) actions(msgs[m.seq]); });
       }
       zone.appendChild(b);
       return b;
@@ -300,6 +303,16 @@
         });
         b.appendChild(im);
       }
+      if (m.fk === 'audio') {
+        if (m.fic) {
+          b.appendChild(h('audio', { controls: '', preload: 'none', src: '/fic/' + m.fic + '?t=' + encodeURIComponent(S.tok) }));
+          b.appendChild(h('small', { class: 'dur' }, '🎤 ' + dureTxt(m.dur)));
+        } else b.appendChild(h('i', { class: 'del' }, '🎤 Envoi du vocal…'));
+      }
+      if (m.fk === 'pdf') {
+        b.appendChild(m.fic ? h('a', { class: 'doc', href: '/fic/' + m.fic + '?t=' + encodeURIComponent(S.tok), target: '_blank', rel: 'noopener' }, '📄 ' + (m.fn || 'Document'))
+          : h('span', { class: 'doc' }, '📄 ' + (m.fn || 'Document') + ' (envoi…)'));
+      }
       if (m.auto) b.appendChild(h('div', { class: 'auto' }, 'Message automatique'));
       if (m.del) b.appendChild(h('i', { class: 'del' }, 'Message supprimé'));
       else if (m.t) b.appendChild(document.createTextNode(m.t));
@@ -318,6 +331,8 @@
       b.scrollIntoView({ block: 'center' }); b.classList.add('flash');
       setTimeout(function () { b.classList.remove('flash'); }, 1300);
     }
+    function lib(m) { return m.t || (m.fk === 'audio' ? '🎤 Message vocal' : (m.fk === 'pdf' ? '📄 ' + (m.fn || 'Document') : 'Photo')); }
+    function dureTxt(s) { s = Math.max(0, Math.round(s || 0)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
     function nomDe(m) { return m.de === o.moi ? 'Toi' : (o.moi === 'v' ? 'DAJ' : o.titre); }
     function corps(x) { if (o.uid) x.uid = o.uid; return x; }
     function reagir(m, e) {
@@ -366,7 +381,7 @@
       replybar.innerHTML = '';
       if (!citer) { replybar.classList.add('hide'); return; }
       replybar.classList.remove('hide');
-      replybar.appendChild(h('div', { class: 'qt' }, h('b', {}, nomDe(citer)), h('span', {}, citer.t || 'Photo')));
+      replybar.appendChild(h('div', { class: 'qt' }, h('b', {}, nomDe(citer)), h('span', {}, lib(citer))));
       replybar.appendChild(h('button', { 'aria-label': 'Annuler', onclick: function () { citer = null; montrerCiter(); } }, '✕'));
     }
     function pinsChange(l) {
@@ -385,7 +400,7 @@
         var l = h('div', { class: 'lgs' });
         (r.d.msgs || []).forEach(function (m) {
           l.appendChild(h('div', { class: 'lg', onclick: function () { fermer(); aller(m.seq); } },
-            h('b', {}, nomDe(m) + ' · ' + jour(m.ts) + ' ' + heure(m.ts)), h('span', {}, m.t || 'Photo')));
+            h('b', {}, nomDe(m) + ' · ' + jour(m.ts) + ' ' + heure(m.ts)), h('span', {}, lib(m))));
         });
         if (!l.childNodes.length) l.appendChild(h('div', { class: 'vide' }, 'Rien d\'épinglé.'));
         var fermer = feuille([h('h2', {}, 'Messages épinglés'), l, h('button', { class: 'btn lt', onclick: function () { fermer(); } }, 'Fermer')]);
@@ -466,25 +481,100 @@
       rd.readAsDataURL(file);
     }
     function montrerPrev() {
-      prev.innerHTML = '';
+      prev.innerHTML = ''; basculer();
       if (!img) { prev.classList.add('hide'); return; }
       prev.classList.remove('hide');
       prev.appendChild(h('img', { src: img, alt: '' })); prev.appendChild(h('span', {}, 'Photo prête'));
       prev.appendChild(h('button', { 'aria-label': 'Retirer', onclick: function () { img = ''; montrerPrev(); } }, '✕'));
     }
     fic.addEventListener('change', function () {
-      var f = fic.files && fic.files[0]; fic.value = ''; if (!f) return;
-      redim(f, function (d) { img = d; montrerPrev(); });
+      var fs = Array.prototype.slice.call(fic.files || [], 0, 6); fic.value = ''; if (!fs.length) return;
+      if (fs.length === 1) { redim(fs[0], function (d) { img = d; montrerPrev(); }); return; }
+      toast('Envoi de ' + fs.length + ' photos…');
+      var i = 0;
+      (function suite() {
+        if (i >= fs.length) return;
+        redim(fs[i++], function (d) { poster({ image: d }, { de: o.moi, img: d }).then(function (ok) { if (ok) suite(); }); });
+      })();
     });
-    cam.addEventListener('click', function () { fic.click(); });
-    ta.addEventListener('input', function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 130) + 'px'; ecrire(); });
+    // LOT2B_V1 : fichiers, vocaux
+    var fdoc = h('input', { type: 'file', accept: 'application/pdf,.pdf', class: 'hide' });
+    function basculer() {
+      var plein = !!(ta.value.trim() || img);
+      env.classList[plein ? 'remove' : 'add']('hide'); mic.classList[plein ? 'add' : 'remove']('hide');
+    }
+    function lireData(f, fin) {
+      var rd = new FileReader(); rd.onload = function () { fin(String(rd.result)); }; rd.onerror = function () { toast('Fichier illisible'); };
+      rd.readAsDataURL(f);
+    }
+    function poster(extra, apercu) {
+      var b = {}; for (var k in extra) b[k] = extra[k]; if (o.uid) b.uid = o.uid;
+      if (vide.parentNode) vide.parentNode.removeChild(vide);
+      var p = bulle(apercu, true); bas();
+      return api('/api/send', { body: b }).then(function (r) {
+        if (p.parentNode) p.parentNode.removeChild(p);
+        if (!r.ok) { toast(r.d.erreur || 'Pas envoyé'); if (!dernier) zone.appendChild(vide); return false; }
+        ajouter([r.d.msg]); bas(); return true;
+      });
+    }
+    fdoc.addEventListener('change', function () {
+      var f = fdoc.files && fdoc.files[0]; fdoc.value = ''; if (!f) return;
+      if (!/\.pdf$/i.test(f.name) && f.type !== 'application/pdf') { toast('Choisis un fichier PDF'); return; }
+      if (f.size > 650000) { toast('PDF trop lourd (650 Ko maximum)'); return; }
+      lireData(f, function (d) {
+        var data = 'data:application/pdf;base64,' + d.slice(d.indexOf(',') + 1);
+        poster({ fichier: data, fn: f.name }, { de: o.moi, fk: 'pdf', fn: f.name });
+      });
+    });
+    cam.addEventListener('click', function () {
+      var fermer = feuille([h('h2', {}, 'Joindre'),
+        h('button', { class: 'btn', onclick: function () { fermer(); fic.click(); } }, '📷 Photos (jusqu\'à 6)'),
+        h('button', { class: 'btn', onclick: function () { fermer(); fdoc.click(); } }, '📄 Document PDF'),
+        h('button', { class: 'btn lt', onclick: function () { fermer(); } }, 'Annuler')]);
+    });
+    function finVocal() { clearInterval(recTimer); recBar.classList.add('hide'); recBar.innerHTML = ''; rec = null; }
+    var recTimer = null;
+    mic.addEventListener('click', function () {
+      if (rec) return;
+      if (!navigator.mediaDevices || !window.MediaRecorder) { toast('Vocal indisponible sur cet appareil'); return; }
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(function (flux) {
+        var typ = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].filter(function (t) { return MediaRecorder.isTypeSupported(t); })[0] || '';
+        var mr;
+        try { mr = new MediaRecorder(flux, typ ? { mimeType: typ, audioBitsPerSecond: 24000 } : { audioBitsPerSecond: 24000 }); }
+        catch (e) { flux.getTracks().forEach(function (t) { t.stop(); }); toast('Vocal indisponible sur cet appareil'); return; }
+        var morceaux = [], taille = 0, t0 = Date.now(), annule = false, trop = false;
+        mr.ondataavailable = function (e) {
+          if (e.data && e.data.size) { morceaux.push(e.data); taille += e.data.size; if (taille > 600000 && mr.state !== 'inactive') { trop = true; mr.stop(); } }
+        };
+        mr.onstop = function () {
+          flux.getTracks().forEach(function (t) { t.stop(); }); finVocal();
+          if (annule || !morceaux.length) return;
+          if (trop) toast('Durée maximale atteinte, envoi du vocal');
+          var dur = Math.max(1, Math.round((Date.now() - t0) / 1000));
+          var blob = new Blob(morceaux, { type: mr.mimeType || typ || 'audio/webm' });
+          lireData(blob, function (d) { poster({ fichier: d, dur: dur }, { de: o.moi, fk: 'audio' }); });
+        };
+        mr.start(1000);
+        rec = true;
+        var lab = h('span', {}, '● 0:00');
+        recBar.innerHTML = ''; recBar.classList.remove('hide');
+        recBar.appendChild(lab);
+        recBar.appendChild(h('button', { 'aria-label': 'Annuler le vocal', onclick: function () { annule = true; if (mr.state !== 'inactive') mr.stop(); } }, '🗑'));
+        recBar.appendChild(h('button', { class: 'vgo', 'aria-label': 'Envoyer le vocal', onclick: function () { if (mr.state !== 'inactive') mr.stop(); } }, 'Envoyer ➤'));
+        recTimer = setInterval(function () {
+          var s = Math.round((Date.now() - t0) / 1000); lab.textContent = '● ' + dureTxt(s);
+          if (s >= 180 && mr.state !== 'inactive') mr.stop();
+        }, 500);
+      }, function () { toast('Micro refusé : autorise-le dans les réglages du navigateur'); });
+    });
+    ta.addEventListener('input', function () { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 130) + 'px'; ecrire(); basculer(); });
     function envoyer() {
       var t = ta.value.trim(), im = img;
       if ((!t && !im) || enCours) return;
       enCours = true; env.disabled = true;
       if (vide.parentNode) vide.parentNode.removeChild(vide);
       var c0 = citer;
-      var p = bulle({ de: o.moi, t: t, img: im, re: c0 ? c0.seq : 0, re_t: c0 ? (c0.t || 'Photo').slice(0, 80) : '', re_de: c0 ? c0.de : '' }, true); bas();
+      var p = bulle({ de: o.moi, t: t, img: im, re: c0 ? c0.seq : 0, re_t: c0 ? lib(c0).slice(0, 80) : '', re_de: c0 ? c0.de : '' }, true); bas();
       ta.value = ''; ta.style.height = 'auto'; img = ''; montrerPrev(); citer = null; montrerCiter();
       var body = { texte: t, image: im || undefined, re: c0 ? c0.seq : undefined }; if (o.uid) body.uid = o.uid;
       api('/api/send', { body: body }).then(function (r) {
@@ -503,8 +593,9 @@
       o.cloche ? h('button', { class: 'ib', 'aria-label': 'Notifications', onclick: o.cloche }, '🔔') : null,
       o.menu ? h('button', { class: 'ib', 'aria-label': 'Menu', onclick: o.menu }, '⋮') : null,
       o.quitter ? h('button', { class: 'ib', 'aria-label': 'Quitter', onclick: o.quitter }, '⎋') : null);
-    root.appendChild(tete); root.appendChild(pinbar); root.appendChild(zone); root.appendChild(prev); root.appendChild(replybar);
-    root.appendChild(h('div', { class: 'compose' }, o.moi === 'd' ? eclair : null, cam, fic, ta, env));
+    root.appendChild(tete); root.appendChild(pinbar); root.appendChild(zone); root.appendChild(prev); root.appendChild(replybar); root.appendChild(recBar);
+    root.appendChild(h('div', { class: 'compose' }, o.moi === 'd' ? eclair : null, cam, fic, fdoc, ta, env, mic));
+    basculer();
     charger(0, true);
     timers.push(setInterval(function () { if (!document.hidden) charger(dernier, false); }, 2500));
     document.onvisibilitychange = function () { if (!document.hidden) { charger(dernier, false); marquer(); } };

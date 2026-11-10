@@ -83,6 +83,43 @@ def sauver_image(data_url, uid):
     return nom
 
 
+# LOT2B_V1 : messages vocaux et documents PDF (stockes comme les photos)
+FICHIERS = {"audio/webm": (".webm", "audio", b"\x1a\x45\xdf\xa3", 0), "audio/ogg": (".ogg", "audio", b"OggS", 0),
+            "audio/mp4": (".m4a", "audio", b"ftyp", 4), "application/pdf": (".pdf", "pdf", b"%PDF-", 0)}
+
+
+def sauver_fichier(data_url, uid, nom_orig="", dur=0):
+    m = re.match(r"data:(audio/webm|audio/ogg|audio/mp4|application/pdf)(?:;[^;,]*)*;base64,([A-Za-z0-9+/=\s]+)$", data_url or "")
+    if not m:
+        raise ValueError("Fichier invalide.")
+    mime = m.group(1)
+    raw = base64.b64decode(m.group(2))
+    if len(raw) > 700_000:
+        raise ValueError("Fichier trop lourd (700 Ko maximum).")
+    ext, kind, sig, off = FICHIERS[mime]
+    if raw[off:off + len(sig)] != sig:
+        raise ValueError("Fichier invalide.")
+    nom = secrets.token_hex(12) + ext
+    STORE.image_enregistrer(nom, uid, mime, raw)
+    try:
+        dur = max(0, min(int(dur or 0), 600))
+    except (TypeError, ValueError):
+        dur = 0
+    fn = propre(nom_orig, 60) if kind == "pdf" else ""
+    lt = "🎤 Message vocal" if kind == "audio" else "📄 " + (fn or "Document")
+    return {"fic": nom, "fk": kind, "fn": fn, "dur": dur if kind == "audio" else 0, "lt": lt}
+
+
+def libelle(m):
+    if m.get("t"):
+        return m["t"]
+    if m.get("fk") == "audio":
+        return "🎤 Message vocal"
+    if m.get("fk") == "pdf":
+        return "📄 " + (m.get("fn") or "Document")
+    return "Photo"
+
+
 # LOT1_V1 : notifications, rappels, message d'absence
 DEFAUT_CFG = {"rappel_h": 3, "absence_on": False,
               "absence_txt": "Bonjour ! Je suis indisponible pour le moment. Je réponds à tes messages dès que possible.",
@@ -148,9 +185,9 @@ def pousser(role, uid, titre, corps, tag):
         threading.Thread(target=run, daemon=True).start()
 
 
-def apres_envoi(uid, de, texte):
+def apres_envoi(uid, de, texte, lt=""):
     u = STORE.user(uid) or {}
-    apercu = texte[:90] if texte else "📷 Photo"
+    apercu = texte[:90] if texte else (lt or "📷 Photo")
     if de == "v":
         if not u.get("muet"):
             pousser("d", "", u.get("nom", "Vendeuse"), apercu, "v" + uid)
@@ -249,7 +286,7 @@ def texte_export(nom, msgs):
     l = ["Conversation DAJ avec " + nom, "Export du " + time.strftime("%d/%m/%Y %H:%M UTC", time.gmtime()), ""]
     for m in msgs:
         qui = "Développeur" if m["de"] == "d" else nom
-        corps = "[message supprimé]" if m.get("del") else (m.get("t") or "") + (" [photo]" if m.get("img") else "")
+        corps = "[message supprimé]" if m.get("del") else (m.get("t") or "") + (" [photo]" if m.get("img") else "") + (" [message vocal]" if m.get("fk") == "audio" else "") + (" [PDF : %s]" % m.get("fn", "") if m.get("fk") == "pdf" else "")
         l.append("[%s] %s : %s" % (m["ts"], qui, corps.strip()))
     return "\n".join(l) + "\n"
 
@@ -420,6 +457,48 @@ class H(BaseHTTPRequestHandler):
             return self.json({"msgs": l or [], "n": d.get("n", 0), "lu_v": d.get("lu_v", 0), "lu_dev": d.get("lu_dev", 0), "nom": d.get("nom", ""),
                               "mv": d.get("mv", 0), "maj": STORE.modifs(uid, mv) if (mv or apres) else [], "pins": list(d.get("pins") or []),
                               "ecrit": time.time() - TYPING.get((uid, autre), 0) < 6})
+        m = re.match(r"^/fic/([0-9a-f]{24}\.(?:webm|ogg|m4a|pdf))$", p)
+        if m:
+            a = self.auth()
+            if not a:
+                self.send_response(401); self.end_headers(); return
+            nom = m.group(1)
+            hit = IMG_CACHE.get(nom) or STORE.image_lire(nom)
+            if not hit or (a[0] == "v" and hit[0] != a[1]):
+                self.send_response(404); self.end_headers(); return
+            if nom not in IMG_CACHE:
+                if len(IMG_CACHE) >= 40:
+                    IMG_CACHE.pop(next(iter(IMG_CACHE)))
+                IMG_CACHE[nom] = hit
+            data = hit[2]
+            total = len(data)
+            code, deb, fin = 200, 0, total - 1
+            rg = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
+            if rg and (rg.group(1) or rg.group(2)):
+                if rg.group(1):
+                    deb = int(rg.group(1))
+                    fin = min(int(rg.group(2)), total - 1) if rg.group(2) else total - 1
+                else:
+                    deb = max(0, total - int(rg.group(2)))
+                if deb > fin or deb >= total:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % total)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                code = 206
+                data = data[deb:fin + 1]
+            self.send_response(code)
+            self.send_header("Content-Type", hit[1])
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Accept-Ranges", "bytes")
+            if code == 206:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (deb, fin, total))
+            self.send_header("Cache-Control", "private, max-age=86400")
+            self.entetes()
+            self.end_headers()
+            self.wfile.write(data)
+            return
         m = re.match(r"^/img/([0-9a-f]{24}\.(?:jpg|png|webp))$", p)
         if m:
             a = self.auth()
@@ -520,7 +599,7 @@ class H(BaseHTTPRequestHandler):
                 return self.json({"erreur": "Doucement, réessaie dans une minute."}, 429)
             texte = str(d.get("texte") or "").strip()[:2000]
             img = d.get("image")
-            if not texte and not img:
+            if not texte and not img and not d.get("fichier"):
                 raise ValueError("Message vide.")
             cite = None
             if d.get("re"):
@@ -531,12 +610,14 @@ class H(BaseHTTPRequestHandler):
                 orig = STORE.msg_get(uid, rs)
                 if not orig or orig.get("del"):
                     raise ValueError("Le message auquel tu réponds n'existe plus.")
-                cite = {"re": rs, "re_de": orig["de"], "re_t": (orig.get("t") or "Photo")[:80]}
+                cite = {"re": rs, "re_de": orig["de"], "re_t": libelle(orig)[:80]}
             nom = sauver_image(img, uid) if img else ""
+            if d.get("fichier"):
+                cite = dict(cite or {}, **sauver_fichier(d["fichier"], uid, d.get("fn"), d.get("dur")))
             HITS.setdefault("s:" + uid + a[0], []).append(time.time())
             m = STORE.envoyer(uid, a[0], texte, nom, cite=cite)
             try:
-                apres_envoi(uid, a[0], texte)
+                apres_envoi(uid, a[0], texte, (cite or {}).get("lt", ""))
             except Exception:
                 traceback.print_exc()
             return self.json({"msg": m})
@@ -593,6 +674,9 @@ class H(BaseHTTPRequestHandler):
                 if m and avant and avant.get("img"):
                     STORE.image_supprimer(avant["img"])
                     IMG_CACHE.pop(avant["img"], None)
+                if m and avant and avant.get("fic"):
+                    STORE.image_supprimer(avant["fic"])
+                    IMG_CACHE.pop(avant["fic"], None)
             else:
                 e = str(d.get("emoji") or "")
                 if e and e not in EMOJIS:

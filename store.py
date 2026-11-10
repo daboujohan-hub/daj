@@ -187,6 +187,8 @@ class Store:
         ref = self.db.collection(USERS).document(uid)
         msgs = self.db.collection(MSGS)
         ts = maintenant()
+        cite = dict(cite or {})
+        lt = cite.pop("lt", "")
 
         @firestore.transactional
         def run(tx):
@@ -196,7 +198,7 @@ class Store:
             d = s.to_dict()
             seq = int(d.get("n", 0)) + 1
             m = {"k": "%s|%012d" % (uid, seq), "uid": uid, "seq": seq, "de": de, "t": texte, "img": image, "ts": ts}
-            maj = {"n": seq, "last_text": (texte[:80] if texte else "Photo"), "last_ts": ts, "last_from": de}
+            maj = {"n": seq, "last_text": (texte[:80] if texte else (lt or "Photo")), "last_ts": ts, "last_from": de}
             if cite:
                 m.update(cite)
             if auto:
@@ -242,6 +244,7 @@ class Store:
         d.update(maj)
         self._maj(uid, d)
 
+    # LOT2B_V1 : fichiers (vocaux, PDF) geres comme les photos
     # LOT2A_V1 : citation, modification, suppression, reactions, epingles
     def msg_get(self, uid, seq):
         s = self.db.collection(MSGS).document("%s_%012d" % (uid, seq)).get()
@@ -269,7 +272,7 @@ class Store:
                     raise Refus("Ce message est trop ancien pour être modifié.")
                 ch = {"t": valeur, "ed": maintenant()}
             elif action == "del":
-                ch = {"t": "", "img": "", "del": True, "rx": {}, "re": 0, "re_t": "", "re_de": ""}
+                ch = {"t": "", "img": "", "fic": "", "fk": "", "fn": "", "dur": 0, "del": True, "rx": {}, "re": 0, "re_t": "", "re_de": ""}
             else:
                 rx = dict(m.get("rx") or {})
                 if valeur:
